@@ -173,7 +173,7 @@ class Redis:
                 await self._handle_request(await _read(rd), wr)
         except IncompleteReadError as e:
             if e.partial:
-                self.log.warn('Unexpected EOF from client.')
+                self.log.warning('Unexpected EOF from client.')
         except SyntaxError as e:
             self.log.error('Invalid client command: %s.' % e.msg)
         except Exception as e:
@@ -196,11 +196,11 @@ class Redis:
             await _write(wr, v)
 
         # check for commands
-        if cmdc is None:
-            print(cmds)
-            await _write(wr, Error('unknown command `%s`' % cmds))
-        else:
+        if cmdc is not None:
             await cmdc.handle(self.ctx, args, write_func)
+        else:
+            self.log.warning('Unknown command "%s", dropped.' % cmds)
+            await _write(wr, Error('unknown command `%s`' % cmds))
 
 ### Redis Command Interface ###
 
