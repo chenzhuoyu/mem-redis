@@ -766,6 +766,20 @@ COMMANDS = [
     )
 ]
 
+### Default Redis Implementation ###
+
+DEFAULT_PORT = 6379
+DEFAULT_BIND = '127.0.0.1'
+
+class DefaultRedis(Redis):
+    def __init__(self, bind: str = DEFAULT_BIND, port: int = DEFAULT_PORT):
+        super(DefaultRedis, self).__init__(
+            bind,
+            port,
+            COMMANDS,
+            Storage(),
+        )
+
 ### Bootstrap Routine ###
 
 def main():
@@ -821,7 +835,7 @@ def main():
     signal.signal(signal.SIGQUIT, stop_server)
 
     # start the server
-    rds = Redis(opts.bind, port, COMMANDS, Storage())
+    rds = DefaultRedis(opts.bind, port)
     rds.run()
 
 if __name__ == "__main__":
