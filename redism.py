@@ -122,44 +122,33 @@ def _write_value(wr: StreamWriter, val: Value):
 class Redis:
     ctx  : Any
     log  : logging.Logger
+    xev  : Optional[asyncio.Event]
+    srv  : Optional[asyncio.AbstractServer]
     bind : str
     port : int
-    loop : Optional[BaseEventLoop]
     cmds : Dict[str, 'RedisCommand']
 
     def __init__(self, bind: str, port: int, cmds: List['RedisCommand'], ctx: Any):
         self.ctx  = ctx
+        self.xev  = None
+        self.srv  = None
         self.log  = logging.getLogger('redism')
         self.bind = bind
         self.port = port
-        self.loop = None
         self.cmds = {c.name.upper(): c() for c in cmds}
 
-    def run(self):
-        loop = asyncio.new_event_loop()
-        psrv = loop.run_until_complete(asyncio.start_server(self._handle_conn, self.bind, self.port, loop = loop))
-
-        # log the server start event
-        self.loop = loop
-        self.log.info('Mem Redis started on %s:%d' % (self.bind, self.port))
-
-        # start the server
-        try:
-            loop.run_forever()
-        finally:
-            psrv.close()
-            loop.run_until_complete(psrv.wait_closed())
-            loop.close()
-
     def stop(self):
-        if self.loop is not None:
-            self.loop.call_soon_threadsafe(self._stop_server)
+        if self.xev is not None:
+            asyncio.get_event_loop().call_soon_threadsafe(self.xev.set)
 
-    def _stop_server(self):
-        for task in asyncio.all_tasks(loop = self.loop):
-            task.cancel()
-        else:
-            self.loop.call_soon(self.loop.stop)
+    async def start(self):
+        async with await asyncio.start_server(self._handle_conn, self.bind, self.port) as srv:
+            self.srv = srv
+            self.xev = asyncio.Event()
+            self.log.info('Mem Redis started at %s:%d' % (self.bind, self.port))
+            await self.srv.start_serving()
+            await self.xev.wait()
+            self.log.info('Stopping...')
 
     def _close_writer(self, wr: StreamWriter):
         try:
@@ -823,9 +812,9 @@ def main():
             sys.stdout.flush()
 
     # signal handler
-    def stop_server(*_):
+    def stop_server(sig, _frame):
         nl_iftty()
-        logging.getLogger('redism').info('Stopping ...')
+        logging.info('Got %s.' % signal.Signals(sig).name)
         rds.stop()
 
     # setup the signals
@@ -836,7 +825,7 @@ def main():
 
     # start the server
     rds = DefaultRedis(opts.bind, port)
-    rds.run()
+    asyncio.run(rds.start())
 
 if __name__ == "__main__":
     main()
