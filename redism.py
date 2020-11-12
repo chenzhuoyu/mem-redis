@@ -195,7 +195,7 @@ class Redis:
 
         # check for commands
         if cmdc is None:
-            print(cmds, args)
+            print(cmds)
             await _write(wr, Error('unknown command `%s`' % cmds))
         else:
             await cmdc.handle(self.ctx, args, write_func)
@@ -304,6 +304,8 @@ class Storage:
             if prev is curr:
                 del self.data[prev.key]
 
+### String Commands ###
+
 class DelCommand(RedisCommand):
     name      = 'DEL'
     arity     = -2
@@ -313,10 +315,10 @@ class DelCommand(RedisCommand):
     key_step  = 1
 
     async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
-        if args:
-            await write(ctx.drop(args))
-        else:
+        if not args:
             await write(Error('incorrect number of arguments for command'))
+        else:
+            await write(ctx.drop(args))
 
 class GetCommand(RedisCommand):
     name      = 'GET'
@@ -450,23 +452,6 @@ class SetCommand(RedisCommand):
         else:
             return None, args
 
-class KeysCommand(RedisCommand):
-    name      = 'KEYS'
-    arity     = 1
-    flags     = ['readonly', 'random', 'fast']
-    key_begin = 1
-    key_end   = 1
-    key_step  = 1
-
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
-        if len(args) != 1:
-            await write(Error('incorrect number of arguments for command'))
-        else:
-            await self._handle_keys(ctx, args[0], write)
-
-    async def _handle_keys(self, ctx: Storage, keys: bytes, write: WriterFunction):
-        await write(fnmatch.filter(ctx.keys, keys))
-
 class GetSetCommand(SetCommand):
     name      = 'GETSET'
     arity     = 3
@@ -480,6 +465,100 @@ class GetSetCommand(SetCommand):
             await write(Error('incorrect number of arguments for command'))
         else:
             await self._handle_setp(ctx, args[0], args[1], None, None, True, write)
+
+### Decay Control Commands ###
+
+class TTLCommand(RedisCommand):
+    name      = 'TTL'
+    arity     = 2
+    flags     = ['readonly', 'random', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        await self._handle_ttl(ctx, args, 1000000000, write)
+
+    async def _handle_ttl(self, ctx: Storage, args: List[bytes], factor: int, write: WriterFunction):
+        if len(args) != 1:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_pttl(ctx.get(args[0]), factor, write)
+
+    async def _handle_pttl(self, node: Optional[Node], factor: int, write: WriterFunction) -> int:
+        if node is None:
+            await write(-2)
+        elif node.ttl == -1:
+            await write(-1)
+        else:
+            await write((node.ttl - time.time_ns()) // factor)
+
+class PTTLCommand(TTLCommand):
+    name      = 'PTTL'
+    arity     = 2
+    flags     = ['readonly', 'random', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        await self._handle_ttl(ctx, args, 1000000, write)
+
+class ExpireCommand(RedisCommand):
+    name      = 'EXPIRE'
+    arity     = 3
+    flags     = ['write', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        await self._handle_expire(ctx, args, 1000000000, write)
+
+    async def _handle_expire(self, ctx: Storage, args: List[bytes], factor: int, write: WriterFunction):
+        if len(args) != 2:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            try:
+                ttl = int(args[1])
+            except ValueError:
+                await write(Error('value is not an integer or out of range'))
+            else:
+                await self._handle_sexpire(ctx, ctx.get(args[0]), ttl * factor, write)
+
+    async def _handle_sexpire(self, ctx: Storage, node: Optional[Node], ttl: int, write: WriterFunction):
+        if node is None:
+            await write(0)
+        else:
+            ctx.put(Node(time.time_ns() + ttl, node.key, node.val))
+            await write(1)
+
+class PExpireCommand(ExpireCommand):
+    name      = 'PEXPIRE'
+    arity     = 3
+    flags     = ['write', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        await self._handle_expire(ctx, args, 1000000, write)
+
+### Generic Commands ###
+
+class KeysCommand(RedisCommand):
+    name      = 'KEYS'
+    arity     = 1
+    flags     = ['readonly']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 1:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await write(fnmatch.filter(ctx.keys, args[0]))
 
 class CommandCommand(RedisCommand):
     name      = 'COMMAND'
@@ -545,16 +624,25 @@ class CommandCommand(RedisCommand):
         else:
             await write(r)
 
+### Command Discovery ###
+
+def _is_valid_command(v: Any) -> bool:
+    try:
+        v.descriptor()
+    except Exception as e:
+        return False
+    else:
+        return True
+
 COMMANDS = [
-    DelCommand,
-    GetCommand,
-    SetCommand,
-    KeysCommand,
-    GetSetCommand,
-    CommandCommand,
+    cls for cls in globals().values() if (
+        type(cls) is type and
+        issubclass(cls, RedisCommand) and
+        _is_valid_command(cls)
+    )
 ]
 
-### Bootstrap Helpers ###
+### Bootstrap Routine ###
 
 def main():
     import os
