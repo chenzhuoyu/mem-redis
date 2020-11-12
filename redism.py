@@ -9,8 +9,10 @@ import asyncio
 import logging
 
 from typing import Any
+from typing import Set
 from typing import Dict
 from typing import List
+from typing import Tuple
 from typing import Union
 from typing import Callable
 from typing import Iterable
@@ -134,7 +136,7 @@ class Redis:
         self.cmds = {c.name.upper(): c() for c in cmds}
 
     def run(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
         psrv = loop.run_until_complete(asyncio.start_server(self._handle_conn, self.bind, self.port, loop = loop))
 
         # log the server start event
@@ -200,28 +202,40 @@ class Redis:
         else:
             await cmdc.handle(self.ctx, args, write_func)
 
+### Redis Command Interface ###
+
+class ClassProperty:
+    def __init__(self, fget):
+        self.fget = fget
+
+    def __get__(self, obj, cls = None):
+        return self.fget.__get__(obj, cls or type(obj))()
+
+def clsproperty(method):
+    return ClassProperty(classmethod(method))
+
 class RedisCommand:
-    @property
+    @clsproperty
     def name(self) -> str:
         raise NotImplementedError('not implemented: RedisCommand.name')
 
-    @property
+    @clsproperty
     def arity(self) -> int:
         raise NotImplementedError('not implemented: RedisCommand.arity')
 
-    @property
+    @clsproperty
     def flags(self) -> List[str]:
         raise NotImplementedError('not implemented: RedisCommand.flags')
 
-    @property
+    @clsproperty
     def key_end(self) -> int:
         raise NotImplementedError('not implemented: RedisCommand.key_end')
 
-    @property
+    @clsproperty
     def key_step(self) -> int:
         raise NotImplementedError('not implemented: RedisCommand.key_step')
 
-    @property
+    @clsproperty
     def key_begin(self) -> int:
         raise NotImplementedError('not implemented: RedisCommand.key_begin')
 
@@ -239,12 +253,16 @@ class RedisCommand:
     async def handle(self, ctx: Any, args: List[bytes], write: WriterFunction):
         raise NotImplementedError('not implemented: RedisCommand.handle')
 
-### Command Implementations ###
+del clsproperty
+del ClassProperty
+
+### Storage Implementations ###
 
 MemValue = Union[
     bytes,
+    Set[bytes],
     List[bytes],
-    Dict[str, bytes],
+    Dict[bytes, bytes],
 ]
 
 class Node:
@@ -276,24 +294,17 @@ class Storage:
 
     @property
     def keys(self) -> Iterable[bytes]:
-        self.sweep()
         return self.data.keys()
 
     def get(self, key: bytes) -> Optional[Node]:
-        self.sweep()
         return self.data.get(key)
 
     def put(self, node: Node):
-        self.sweep()
         self.data[node.key] = node
-
-        # add to TTL heap if required
-        if node.ttl >= 0:
-            heapq.heappush(self.heap, node)
+        self.expire(node)
 
     def drop(self, keys: List[bytes]) -> int:
-        self.sweep()
-        return sum(map(bool, (self.data.pop(k, None) for k in keys)))
+        return sum(bool(self.data.pop(k, None)) for k in keys)
 
     def sweep(self):
         while self.heap and time.time_ns() >= self.heap[0].ttl:
@@ -304,9 +315,25 @@ class Storage:
             if prev is curr:
                 del self.data[prev.key]
 
+    def expire(self, node: Node):
+        if node.ttl >= 0:
+            heapq.heappush(self.heap, node)
+
+### Abstract Redis Command ###
+
+class AbstractRedisCommand(RedisCommand):
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        try:
+            await self._handle(ctx, args, write)
+        finally:
+            ctx.sweep()
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        raise NotImplementedError('not implemented: AbstractRedisCommand._handle')
+
 ### String Commands ###
 
-class DelCommand(RedisCommand):
+class DelCommand(AbstractRedisCommand):
     name      = 'DEL'
     arity     = -2
     flags     = ['write']
@@ -314,13 +341,13 @@ class DelCommand(RedisCommand):
     key_end   = -1
     key_step  = 1
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if not args:
             await write(Error('incorrect number of arguments for command'))
         else:
             await write(ctx.drop(args))
 
-class GetCommand(RedisCommand):
+class GetCommand(AbstractRedisCommand):
     name      = 'GET'
     arity     = 2
     flags     = ['readonly', 'fast']
@@ -328,7 +355,7 @@ class GetCommand(RedisCommand):
     key_end   = 1
     key_step  = 1
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if len(args) != 1:
             await write(Error('incorrect number of arguments for command'))
         else:
@@ -342,7 +369,7 @@ class GetCommand(RedisCommand):
         else:
             await write(Error('incorrect value type', kind = 'WRONGTYPE'))
 
-class SetCommand(RedisCommand):
+class SetCommand(AbstractRedisCommand):
     name      = 'SET'
     arity     = -3
     flags     = ['write', 'denyoom']
@@ -353,7 +380,7 @@ class SetCommand(RedisCommand):
     ExpOpt  = Union[None, bool, int]
     CondOpt = Optional[bool]
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if len(args) < 2:
             await write(Error('incorrect number of arguments for command'))
         else:
@@ -453,69 +480,173 @@ class SetCommand(RedisCommand):
             return None, args
 
 class GetSetCommand(SetCommand):
-    name      = 'GETSET'
-    arity     = 3
-    flags     = ['write', 'denyoom', 'fast']
-    key_begin = 1
-    key_end   = 1
-    key_step  = 1
+    name  = 'GETSET'
+    arity = 3
+    flags = ['write', 'denyoom', 'fast']
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if len(args) != 2:
             await write(Error('incorrect number of arguments for command'))
         else:
             await self._handle_setp(ctx, args[0], args[1], None, None, True, write)
 
-### Decay Control Commands ###
+### Hash Commands ###
 
-class TTLCommand(RedisCommand):
-    name      = 'TTL'
-    arity     = 2
-    flags     = ['readonly', 'random', 'fast']
-    key_begin = 1
-    key_end   = 1
-    key_step  = 1
-
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
-        await self._handle_ttl(ctx, args, 1000000000, write)
-
-    async def _handle_ttl(self, ctx: Storage, args: List[bytes], factor: int, write: WriterFunction):
-        if len(args) != 1:
-            await write(Error('incorrect number of arguments for command'))
-        else:
-            await self._handle_pttl(ctx.get(args[0]), factor, write)
-
-    async def _handle_pttl(self, node: Optional[Node], factor: int, write: WriterFunction) -> int:
-        if node is None:
-            await write(-2)
-        elif node.ttl == -1:
-            await write(-1)
-        else:
-            await write((node.ttl - time.time_ns()) // factor)
-
-class PTTLCommand(TTLCommand):
-    name      = 'PTTL'
-    arity     = 2
-    flags     = ['readonly', 'random', 'fast']
-    key_begin = 1
-    key_end   = 1
-    key_step  = 1
-
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
-        await self._handle_ttl(ctx, args, 1000000, write)
-
-class ExpireCommand(RedisCommand):
-    name      = 'EXPIRE'
-    arity     = 3
+class HDelCommand(AbstractRedisCommand):
+    name      = 'HDEL'
+    arity     = -3
     flags     = ['write', 'fast']
     key_begin = 1
     key_end   = 1
     key_step  = 1
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
-        await self._handle_expire(ctx, args, 1000000000, write)
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) < 2:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_hdel(ctx, args[0], ctx.get(args[0]), args[1:], write)
 
-    async def _handle_expire(self, ctx: Storage, args: List[bytes], factor: int, write: WriterFunction):
+    async def _handle_hdel(self, ctx: Storage, key: bytes, node: Optional[Node], keys: List[bytes], write: WriterFunction):
+        if node is None:
+            await write(0)
+        elif isinstance(node.val, dict):
+            await write(sum(bool(node.val.pop(k, None)) for k in keys))
+            node.val or ctx.drop([key])
+        else:
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+
+class HGetCommand(AbstractRedisCommand):
+    name      = 'HGET'
+    arity     = 3
+    flags     = ['readonly', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 2:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_hget(ctx.get(args[0]), args[1], write)
+
+    async def _handle_hget(self, node: Optional[Node], key: bytes, write: WriterFunction):
+        if node is None:
+            await write(None)
+        elif isinstance(node.val, dict):
+            await write(node.val.get(key))
+        else:
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+
+class HSetCommand(AbstractRedisCommand):
+    name      = 'HSET'
+    arity     = -4
+    flags     = ['write', 'denyoom', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) < 3 or not (len(args) & 1):
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_hset(ctx, args[0], ctx.get(args[0]), dict(zip(args[1::2], args[2::2])), write)
+
+    async def _handle_hset(self, ctx: Storage, key: bytes, node: Optional[Node], data: Dict[bytes, bytes], write: WriterFunction):
+        if node is None:
+            ctx.put(Node(-1, key, data))
+            await write(len(data))
+        elif isinstance(node.val, dict):
+            await write(sum(k not in node.val for k in data))
+            node.val.update(data)
+        else:
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+
+class HMGetCommand(AbstractRedisCommand):
+    name      = 'HMGET'
+    arity     = -3
+    flags     = ['readonly', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) < 2:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_hmget(ctx.get(args[0]), args[1:], write)
+
+    async def _handle_hmget(self, node: Optional[Node], keys: List[bytes], write: WriterFunction):
+        if node is None:
+            await write([None] * len(keys))
+        elif isinstance(node.val, dict):
+            await write(list(map(node.val.get, keys)))
+        else:
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+
+class HMSetCommand(HSetCommand):
+    name = 'HMSET'
+
+class HKeysCommand(AbstractRedisCommand):
+    name      = 'HKEYS'
+    arity     = 2
+    flags     = ['readonly']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 1:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_hkeys(ctx.get(args[0]), write)
+
+    async def _handle_hkeys(self, node: Optional[Node], write: WriterFunction):
+        if node is None:
+            await write([])
+        elif isinstance(node.val, dict):
+            await write(list(node.val.keys()))
+        else:
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+
+### Decay Control Commands ###
+
+class TTLCommand(AbstractRedisCommand):
+    name       = 'TTL'
+    arity      = 2
+    flags      = ['readonly', 'random', 'fast']
+    key_begin  = 1
+    key_end    = 1
+    key_step   = 1
+    ttl_factor = 1000000000
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 1:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_ttl(ctx.get(args[0]), write)
+
+    async def _handle_ttl(self, node: Optional[Node], write: WriterFunction) -> int:
+        if node is None:
+            await write(-2)
+        elif node.ttl == -1:
+            await write(-1)
+        else:
+            await write((node.ttl - time.time_ns()) // self.ttl_factor)
+
+class PTTLCommand(TTLCommand):
+    name       = 'PTTL'
+    ttl_factor = 1000000
+
+class ExpireCommand(AbstractRedisCommand):
+    name       = 'EXPIRE'
+    arity      = 3
+    flags      = ['write', 'fast']
+    key_begin  = 1
+    key_end    = 1
+    key_step   = 1
+    ttl_factor = 1000000000
+
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if len(args) != 2:
             await write(Error('incorrect number of arguments for command'))
         else:
@@ -524,9 +655,9 @@ class ExpireCommand(RedisCommand):
             except ValueError:
                 await write(Error('value is not an integer or out of range'))
             else:
-                await self._handle_sexpire(ctx, ctx.get(args[0]), ttl * factor, write)
+                await self._handle_expire(ctx, ctx.get(args[0]), ttl * self.ttl_factor, write)
 
-    async def _handle_sexpire(self, ctx: Storage, node: Optional[Node], ttl: int, write: WriterFunction):
+    async def _handle_expire(self, ctx: Storage, node: Optional[Node], ttl: int, write: WriterFunction):
         if node is None:
             await write(0)
         else:
@@ -534,19 +665,12 @@ class ExpireCommand(RedisCommand):
             await write(1)
 
 class PExpireCommand(ExpireCommand):
-    name      = 'PEXPIRE'
-    arity     = 3
-    flags     = ['write', 'fast']
-    key_begin = 1
-    key_end   = 1
-    key_step  = 1
-
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
-        await self._handle_expire(ctx, args, 1000000, write)
+    name       = 'PEXPIRE'
+    ttl_factor = 1000000
 
 ### Generic Commands ###
 
-class KeysCommand(RedisCommand):
+class KeysCommand(AbstractRedisCommand):
     name      = 'KEYS'
     arity     = 1
     flags     = ['readonly']
@@ -554,13 +678,13 @@ class KeysCommand(RedisCommand):
     key_end   = 1
     key_step  = 1
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if len(args) != 1:
             await write(Error('incorrect number of arguments for command'))
         else:
             await write(fnmatch.filter(ctx.keys, args[0]))
 
-class CommandCommand(RedisCommand):
+class CommandCommand(AbstractRedisCommand):
     name      = 'COMMAND'
     arity     = -1
     flags     = ['random', 'loading', 'stale']
@@ -568,7 +692,7 @@ class CommandCommand(RedisCommand):
     key_end   = 0
     key_step  = 0
 
-    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+    async def _handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if not args:
             await self._handle_list(write)
         elif args[0].upper() == b'INFO':
