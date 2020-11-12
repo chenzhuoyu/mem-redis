@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import time
+import heapq
 import signal
+import fnmatch
 import asyncio
 import logging
 
@@ -10,6 +13,7 @@ from typing import Dict
 from typing import List
 from typing import Union
 from typing import Callable
+from typing import Iterable
 from typing import Optional
 
 from asyncio import StreamReader
@@ -19,25 +23,12 @@ from asyncio import IncompleteReadError
 
 ### Protocol Implementations ###
 
-VT_ERR   = ord('-')
-VT_INT   = ord(':')
-VT_STR   = ord('+')
-VT_BLOB  = ord('$')
-VT_ARRAY = ord('*')
-
 Value = Union[
     int,
     str,
     Optional[bytes],
-    'Array',
+    Iterable['Value'],
 ]
-
-Array = List[Union[
-    int,
-    str,
-    Optional[bytes],
-    'Array',
-]]
 
 WriterFunction = Callable[
     [Value],
@@ -59,36 +50,37 @@ class Error:
         else:
             return self.kind + ' ' + self.msg
 
-async def _read(rd: StreamReader) -> (int, Value):
-    vt, = await rd.readexactly(1)
-    rdf = __reader_map__[vt]
+async def _read(rd: StreamReader) -> List[bytes]:
+    ret = []
+    size = await _read_size(rd, b'*')
 
-    # check for value type
-    if rdf is None:
-        raise SyntaxError('invalid type tag: ' + repr(chr(vt)))
+    # check for size
+    if size < 0:
+        raise SyntaxError('negative array size')
+
+    # read every element
+    for _ in range(size):
+        ret.append(await _read_binary(rd))
     else:
-        return vt, await rdf(rd)
+        return ret
 
-async def _read_err(_: StreamReader):
-    raise SyntaxError('client should not send ERR to server')
+async def _read_size(rd: StreamReader, tag: bytes) -> int:
+    if await rd.readexactly(1) != tag:
+        raise SyntaxError('invalid header type')
+    else:
+        return int((await rd.readline()).strip())
 
-async def _read_int(rd: StreamReader) -> int:
-    return int((await rd.readline()).strip())
-
-async def _read_str(rd: StreamReader) -> str:
-    return (await rd.readline()).decode('utf-8')
-
-async def _read_blob(rd: StreamReader) -> Optional[bytes]:
+async def _read_binary(rd: StreamReader) -> Optional[bytes]:
     rv = None
-    nb = await _read_int(rd)
+    nb = await _read_size(rd, b'$')
+
+    # negative values other than `-1` are invalid
+    if nb < -1:
+        raise SyntaxError('invalid bulk string length: %d' % nb)
 
     # special case for `Null`
     if nb == -1:
         return rv
-
-    # other negative values are invalid
-    if nb < 0:
-        raise SyntaxError('invalid bulk string length: %d' % nb)
 
     # read the blob
     rv = await rd.readexactly(nb)
@@ -100,21 +92,6 @@ async def _read_blob(rd: StreamReader) -> Optional[bytes]:
     else:
         return rv
 
-async def _read_array(rd: StreamReader) -> Array:
-    ret = []
-    size = await _read_int(rd)
-
-    # check for size
-    if size < 0:
-        raise SyntaxError('negative array size')
-
-    # read every element
-    for _ in range(size):
-        _, vv = await _read(rd)
-        ret.append(vv)
-    else:
-        return ret
-
 async def _write(wr: StreamWriter, val: Value):
     _write_value(wr, val)
     await wr.drain()
@@ -123,32 +100,22 @@ def _write_value(wr: StreamWriter, val: Value):
     if val is None:
         wr.write(b'$-1\r\n')
     elif isinstance(val, int):
-        wr.write((':%d\r\n' % val).encode('utf-8'))
+        wr.write(b':%d\r\n' % val)
     elif isinstance(val, str):
-        wr.write(('+%s\r\n' % val).encode('utf-8'))
+        wr.write(b'+%s\r\n' % val.encode('utf-8'))
     elif isinstance(val, bytes):
         wr.write(b'$%d\r\n%s\r\n' % (len(val), val))
     elif isinstance(val, Error):
-        wr.write(('-%s\r\n' % val.error).encode('utf-8'))
-    elif isinstance(val, (set, list, tuple)):
-        _write_array_len(wr, val)
-        _write_array_body(wr, val)
+        wr.write(b'-%s\r\n' % val.error.encode('utf-8'))
     else:
-        raise TypeError('invalid value type: ' + type(val).__name__)
-
-def _write_array_len(wr: StreamWriter, val: Array):
-    wr.write(('*%d\r\n' % len(val)).encode('utf-8'))
-
-def _write_array_body(wr: StreamWriter, val: Array):
-    for vv in val:
-        _write_value(wr, vv)
-
-__reader_map__ = [None] * 256
-__reader_map__[VT_ERR  ] = _read_err
-__reader_map__[VT_INT  ] = _read_int
-__reader_map__[VT_STR  ] = _read_str
-__reader_map__[VT_BLOB ] = _read_blob
-__reader_map__[VT_ARRAY] = _read_array
+        try:
+            it = iter(val)
+            wr.write(b'*%d\r\n' % len(val))
+        except TypeError:
+            raise TypeError('invalid value type: ' + type(val).__name__)
+        else:
+            for vv in it:
+                _write_value(wr, vv)
 
 class Redis:
     ctx  : Any
@@ -168,8 +135,7 @@ class Redis:
 
     def run(self):
         loop = asyncio.get_event_loop()
-        coro = asyncio.start_server(self._handle_conn, self.bind, self.port, loop = loop)
-        psrv = loop.run_until_complete(coro)
+        psrv = loop.run_until_complete(asyncio.start_server(self._handle_conn, self.bind, self.port, loop = loop))
 
         # log the server start event
         self.loop = loop
@@ -202,14 +168,7 @@ class Redis:
     async def _handle_conn(self, rd: StreamReader, wr: StreamWriter):
         try:
             while True:
-                vt, args = await _read(rd)
-                if vt != VT_ARRAY:
-                    self.log.error('Invalid client command: expected to be an array.')
-                    break
-                if not args:
-                    self.log.error('Invalid client command: empty command.')
-                    break
-                await self._handle_command(args[0], args[1:], wr)
+                await self._handle_request(await _read(rd), wr)
         except IncompleteReadError as e:
             if e.partial:
                 self.log.warn('Unexpected EOF from client.')
@@ -220,7 +179,13 @@ class Redis:
         finally:
             self._close_writer(wr)
 
-    async def _handle_command(self, cmd: str, args: List[Value], wr: StreamWriter):
+    async def _handle_request(self, req: List[bytes], wr: StreamWriter):
+        if not req:
+            raise SyntaxError('empty command')
+        else:
+            await self._handle_command(req[0], req[1:], wr)
+
+    async def _handle_command(self, cmd: bytes, args: List[bytes], wr: StreamWriter):
         cmds = cmd.decode('utf-8')
         cmdc = self.cmds.get(cmds.upper())
 
@@ -230,6 +195,7 @@ class Redis:
 
         # check for commands
         if cmdc is None:
+            print(cmds, args)
             await _write(wr, Error('unknown command `%s`' % cmds))
         else:
             await cmdc.handle(self.ctx, args, write_func)
@@ -270,13 +236,87 @@ class RedisCommand:
             cls.key_step,
         )
 
-    async def handle(self, ctx: Any, args: List[Value], write: WriterFunction):
+    async def handle(self, ctx: Any, args: List[bytes], write: WriterFunction):
         raise NotImplementedError('not implemented: RedisCommand.handle')
 
 ### Command Implementations ###
 
-class Context:
-    pass
+MemValue = Union[
+    bytes,
+    List[bytes],
+    Dict[str, bytes],
+]
+
+class Node:
+    ttl: int
+    key: bytes
+    val: MemValue
+
+    def __init__(self, ttl: int, key: bytes, val: MemValue):
+        self.ttl = ttl
+        self.key = key
+        self.val = val
+
+    def __lt__(self, other: Any) -> bool:
+        if not isinstance(other, Node):
+            raise TypeError("'<' not supported between instances of 'Node' and '%s'" % type(other).__name__)
+        else:
+            return 0 <= self.ttl < other.ttl
+
+    def __repr__(self) -> str:
+        return '{NODE:%s:%d}' % (self.key, self.ttl)
+
+class Storage:
+    heap: List[Node]
+    data: Dict[bytes, Node]
+
+    def __init__(self):
+        self.heap = []
+        self.data = {}
+
+    @property
+    def keys(self) -> Iterable[bytes]:
+        self.sweep()
+        return self.data.keys()
+
+    def get(self, key: bytes) -> Optional[Node]:
+        self.sweep()
+        return self.data.get(key)
+
+    def put(self, node: Node):
+        self.sweep()
+        self.data[node.key] = node
+
+        # add to TTL heap if required
+        if node.ttl >= 0:
+            heapq.heappush(self.heap, node)
+
+    def drop(self, keys: List[bytes]) -> int:
+        self.sweep()
+        return sum(map(bool, (self.data.pop(k, None) for k in keys)))
+
+    def sweep(self):
+        while self.heap and time.time_ns() >= self.heap[0].ttl:
+            prev = heapq.heappop(self.heap)
+            curr = self.data.get(prev.key)
+
+            # nodes may be replaced by another node with the same key
+            if prev is curr:
+                del self.data[prev.key]
+
+class DelCommand(RedisCommand):
+    name      = 'DEL'
+    arity     = -2
+    flags     = ['write']
+    key_begin = 1
+    key_end   = -1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if args:
+            await write(ctx.drop(args))
+        else:
+            await write(Error('incorrect number of arguments for command'))
 
 class GetCommand(RedisCommand):
     name      = 'GET'
@@ -286,8 +326,160 @@ class GetCommand(RedisCommand):
     key_end   = 1
     key_step  = 1
 
-    async def handle(self, ctx: Context, args: List[Value], write: WriterFunction):
-        await write('hello, world')
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 1:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._write_node(ctx.get(args[0]), write)
+
+    async def _write_node(self, val: Optional[Node], write: WriterFunction):
+        if val is None:
+            await write(None)
+        elif isinstance(val.val, bytes):
+            await write(val.val)
+        else:
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+
+class SetCommand(RedisCommand):
+    name      = 'SET'
+    arity     = -3
+    flags     = ['write', 'denyoom']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    ExpOpt  = Union[None, bool, int]
+    CondOpt = Optional[bool]
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) < 2:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_set(ctx, args[0], args[1], args[2:], write)
+
+    async def _handle_set(self, ctx: Storage, key: bytes, val: bytes, args: List[bytes], write: WriterFunction):
+        try:
+            ttl, args = self._parse_ttl(args)
+            cond, args = self._parse_cond(args)
+        except ValueError:
+            await write(Error('value is not an integer or out of range'))
+        else:
+            if not args:
+                await self._handle_setp(ctx, key, val, ttl, cond, False, write)
+            elif len(args) == 1 and args[0].upper() == b'GET':
+                await self._handle_setp(ctx, key, val, ttl, cond, True, write)
+            else:
+                await write(Error('incorrect number of arguments for command'))
+
+    async def _handle_setp(self, ctx: Storage, key: bytes, val: bytes, ttl: ExpOpt, cond: CondOpt, get: bool, write: WriterFunction):
+        old = ctx.get(key)
+        now = time.time_ns()
+
+        # check for value type when `GET` is present
+        if get and old is not None and not isinstance(old.val, bytes):
+            await write(Error('incorrect value type', kind = 'WRONGTYPE'))
+            return
+
+        # check for 'NX' or 'EX' options
+        if cond is not None:
+            if cond is not (old == None):
+                await write((old and old.val) if get else 'OK')
+                return
+
+        # no ttl specified
+        if ttl is None:
+            put = True
+            new = Node(-1, key, val)
+
+        # 'EX' or 'PX' is set
+        elif ttl is not True:
+            put = True
+            new = Node(now + ttl, key, val)
+
+        # 'KEEPTTL' while the old value exists
+        elif old is not None:
+            new = old
+            put = False
+
+        # 'KEEPTTL' but the old value doesn't exist
+        else:
+            put = True
+            new = Node(-1, key, val)
+
+        # put or update the node
+        if put:
+            ctx.put(new)
+        else:
+            new.val = val
+
+        # return the old value if needed
+        if not get:
+            await write('OK')
+        elif old is None:
+            await write(None)
+        else:
+            await write(old.val)
+
+    def _parse_ttl(self, args: List[bytes]) -> (ExpOpt, List[bytes]):
+        if not args:
+            return None, []
+        else:
+            return self._parse_ttl_mode(args[0].upper(), args)
+
+    def _parse_ttl_mode(self, mode: bytes, args: List[bytes]) -> (ExpOpt, List[bytes]):
+        if mode == b'KEEPTTL':
+            return True, args[1:]
+        elif mode == b'PX':
+            return int(args[1]) * 1000000, args[2:]
+        elif mode == b'EX':
+            return int(args[1]) * 1000000000, args[2:]
+        else:
+            return None, args
+
+    def _parse_cond(self, args: List[bytes]) -> (CondOpt, List[bytes]):
+        if not args:
+            return None, []
+        else:
+            return self._parse_cond_mode(args[0].upper(), args)
+
+    def _parse_cond_mode(self, mode: bytes, args: List[bytes]) -> (CondOpt, List[bytes]):
+        if mode == b'NX':
+            return True, args[1:]
+        elif mode == b'XX':
+            return False, args[1:]
+        else:
+            return None, args
+
+class KeysCommand(RedisCommand):
+    name      = 'KEYS'
+    arity     = 1
+    flags     = ['readonly', 'random', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 1:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_keys(ctx, args[0], write)
+
+    async def _handle_keys(self, ctx: Storage, keys: bytes, write: WriterFunction):
+        await write(fnmatch.filter(ctx.keys, keys))
+
+class GetSetCommand(SetCommand):
+    name      = 'GETSET'
+    arity     = 3
+    flags     = ['write', 'denyoom', 'fast']
+    key_begin = 1
+    key_end   = 1
+    key_step  = 1
+
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
+        if len(args) != 2:
+            await write(Error('incorrect number of arguments for command'))
+        else:
+            await self._handle_setp(ctx, args[0], args[1], None, None, True, write)
 
 class CommandCommand(RedisCommand):
     name      = 'COMMAND'
@@ -297,7 +489,7 @@ class CommandCommand(RedisCommand):
     key_end   = 0
     key_step  = 0
 
-    async def handle(self, ctx: Context, args: List[Value], write: WriterFunction):
+    async def handle(self, ctx: Storage, args: List[bytes], write: WriterFunction):
         if not args:
             await self._handle_list(write)
         elif args[0].upper() == b'INFO':
@@ -305,7 +497,7 @@ class CommandCommand(RedisCommand):
         elif args[0].upper() == b'COUNT' and len(args) == 1:
             await self._handle_count(write)
         elif args[0].upper() == b'GETKEYS' and len(args) >= 2:
-            await self._handle_getkeys(write, args[1].decode('utf-8'), args[2:])
+            await self._handle_getkeys(write, args[1], args[2:])
         else:
             await write(Error('unknown subcommand or wrong number of arguments for `%s`'))
 
@@ -337,7 +529,7 @@ class CommandCommand(RedisCommand):
 
         # check for argc
         if (cmdc.arity < 0 and len(args) < -cmdc.arity - 1) or (cmdc.arity >= 0 and len(args) != cmdc.arity - 1):
-            await write(Error('incorrect number of arguments for command `%s`' % cmd))
+            await write(Error('incorrect number of arguments for command'))
             return
 
         # key positioning information
@@ -354,7 +546,11 @@ class CommandCommand(RedisCommand):
             await write(r)
 
 COMMANDS = [
+    DelCommand,
     GetCommand,
+    SetCommand,
+    KeysCommand,
+    GetSetCommand,
     CommandCommand,
 ]
 
@@ -413,7 +609,7 @@ def main():
     signal.signal(signal.SIGQUIT, stop_server)
 
     # start the server
-    rds = Redis(opts.bind, port, COMMANDS, Context())
+    rds = Redis(opts.bind, port, COMMANDS, Storage())
     rds.run()
 
 if __name__ == "__main__":
