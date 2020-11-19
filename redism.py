@@ -4,6 +4,7 @@
 import time
 import heapq
 import signal
+import socket
 import fnmatch
 import asyncio
 import logging
@@ -119,22 +120,33 @@ def _write_value(wr: StreamWriter, val: Value):
             for vv in it:
                 _write_value(wr, vv)
 
+class Log:
+    @classmethod
+    def get(cls):
+        try:
+            return cls.__logger__
+        except AttributeError:
+            return cls.set(logging.getLogger('redism'))
+
+    @classmethod
+    def set(cls, logger: logging.Logger) -> logging.Logger:
+        cls.__logger__ = logger
+        return logger
+
 class Redis:
     ctx  : Any
     log  : logging.Logger
     xev  : Optional[asyncio.Event]
     srv  : Optional[asyncio.AbstractServer]
-    bind : str
-    port : int
+    sock : socket.socket
     cmds : Dict[str, 'RedisCommand']
 
-    def __init__(self, bind: str, port: int, cmds: List['RedisCommand'], ctx: Any):
+    def __init__(self, sock: socket.socket, cmds: List['RedisCommand'], ctx: Any):
         self.ctx  = ctx
         self.xev  = None
         self.srv  = None
-        self.log  = logging.getLogger('redism')
-        self.bind = bind
-        self.port = port
+        self.log  = Log.get()
+        self.sock = sock
         self.cmds = {c.name.upper(): c() for c in cmds}
 
     def stop(self):
@@ -142,10 +154,10 @@ class Redis:
             asyncio.get_event_loop().call_soon_threadsafe(self.xev.set)
 
     async def start(self):
-        async with await asyncio.start_server(self._handle_conn, self.bind, self.port) as srv:
+        async with await asyncio.start_server(self._handle_conn, sock = self.sock) as srv:
             self.srv = srv
             self.xev = asyncio.Event()
-            self.log.info('Mem Redis started at %s:%d' % (self.bind, self.port))
+            self.log.info('Mem Redis started at %s' % repr(self.sock.getsockname()))
             await self.srv.start_serving()
             await self.xev.wait()
             self.log.info('Stopping...')
@@ -761,10 +773,9 @@ DEFAULT_PORT = 6379
 DEFAULT_BIND = '127.0.0.1'
 
 class DefaultRedis(Redis):
-    def __init__(self, bind: str = DEFAULT_BIND, port: int = DEFAULT_PORT):
+    def __init__(self, addr: Any = (DEFAULT_BIND, DEFAULT_PORT), sock: Optional[socket.socket] = None):
         super(DefaultRedis, self).__init__(
-            bind,
-            port,
+            sock or socket.create_server(addr),
             COMMANDS,
             Storage(),
         )
@@ -824,7 +835,7 @@ def main():
     signal.signal(signal.SIGQUIT, stop_server)
 
     # start the server
-    rds = DefaultRedis(opts.bind, port)
+    rds = DefaultRedis((opts.bind, port))
     asyncio.run(rds.start())
 
 if __name__ == "__main__":
